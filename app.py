@@ -507,14 +507,14 @@ if user_question and st.button("🔍 חפש תשובה", type="primary"):
             # Search for relevant documents
             search_results = search_documents(search_client, user_question, top=25)
             # Fallback – try a semantically‑close variant of the question
-            if not search_results:
-                alt_query = (user_question
-                             .replace("חברי", "הרכב")
-                             .replace("התמיכות", "הוועדה"))
-                if alt_query != user_question:
-                    search_results = search_documents(search_client,
-                                                      alt_query,
-                                                      top=25)
+            # if not search_results:
+            #     alt_query = (user_question
+            #                  .replace("חברי", "הרכב")
+            #                  .replace("התמיכות", "הוועדה"))
+            #     if alt_query != user_question:
+            #         search_results = search_documents(search_client,
+            #                                           alt_query,
+            #                                           top=25)
             
             if search_results:
                 # Prepare context from search results
