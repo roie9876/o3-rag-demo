@@ -29,7 +29,8 @@ from functools import partial
 import socket          # NEW – for DNS check
 from openai import APIConnectionError  # for granular catch
 from httpx import HTTPStatusError
-import ssl, http.client   # NEW – raw HTTPS test
+import ssl, http.client   # NEW – for raw HTTPS test
+import httpx              # ← ADD
 from urllib.parse import urlparse          # already added
 
 from pathlib import Path
@@ -51,6 +52,8 @@ if 'selected_index' not in st.session_state:
     st.session_state.selected_index = None
 if 'available_indexes' not in st.session_state:
     st.session_state.available_indexes = []
+if 'selected_model' not in st.session_state:
+    st.session_state.selected_model = "o3"  # default to o3
 
 # Azure configuration
 AZURE_SEARCH_ENDPOINT = os.getenv("AZURE_SEARCH_ENDPOINT", "")
@@ -67,7 +70,7 @@ st.set_page_config(
 
 # Title and description
 st.title("📚 RAG Application with Azure o3")
-st.markdown("העלה קבצי PDF ושאל שאלות בעברית")
+st.markdown("Upload PDF files and ask questions")
 
 # Debug info (remove in production)
 with st.expander("🔧 Debug Information", expanded=False):
@@ -75,27 +78,83 @@ with st.expander("🔧 Debug Information", expanded=False):
     st.write("Azure Search Key configured:", "Yes" if AZURE_SEARCH_KEY else "No")
     st.write("Current Index:", st.session_state.selected_index or "None selected")
     st.write("Loaded .env file:", ENV_PATH or "Not found")
-    st.write("OpenAI Endpoint (runtime):", os.getenv("AZURE_OPENAI_ENDPOINT"))
+    st.write("OpenAI Endpoint (runtime):",
+             st.session_state.get(f"dbg_endpoint_{st.session_state.selected_model}",
+                                  os.getenv("AZURE_OPENAI_ENDPOINT")))
     st.write("OpenAI Deployment:", os.getenv("AZURE_OPENAI_DEPLOYMENT"))
 
 # Initialize Azure OpenAI client
 # --------------------------- patch init_openai_client --------------------------
+def _check_tls(host: str) -> tuple[bool, str]:
+    """Return (is_open, error_text) for port 443 TLS handshake."""
+    try:
+        with httpx.Client(http2=False, verify=True, timeout=2) as c:
+            c.get(f"https://{host}", headers={"User-Agent": "probe"})
+        return True, ""
+    except Exception as ex:
+        return False, str(ex)
+
 @st.cache_resource
-def init_openai_client():
-    """Return AzureOpenAI client (API-key or AAD)."""
-    # --- read env values ----------------------------------------------------
-    raw_ep      = os.getenv("AZURE_OPENAI_ENDPOINT", "").strip().rstrip("/")
-    deployment  = os.getenv("AZURE_OPENAI_DEPLOYMENT", "").strip()
-    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-04-01-preview")
-    api_key     = os.getenv("AZURE_OPENAI_KEY", "").strip()
-    # ------------------------------------------------------------------------
+def init_openai_client(model_type: str = "o3"):
+    """Return AzureOpenAI client for the selected model (o3 / 4o)."""
+    suffix = "_4o" if model_type == "4o" else ("_41" if model_type == "41" else "")
+    ep_var = f"AZURE_OPENAI_ENDPOINT{suffix}"
 
-    # basic validation
-    if not (raw_ep.startswith("https://") and deployment):
+    raw_ep = os.getenv(ep_var, "").strip()
+
+    # --- NEW auto-fix for “https:/” typo ---------------------------------
+    if raw_ep.startswith("https:/") and not raw_ep.startswith("https://"):
+        raw_ep = "https://" + raw_ep[len("https:/"):].lstrip("/")
+    raw_ep = raw_ep.rstrip("/")
+    # ---------------------------------------------------------------------
+
+    deployment  = os.getenv(f"AZURE_OPENAI_DEPLOYMENT{suffix}", "").strip()
+    api_version = os.getenv(f"AZURE_OPENAI_API_VERSION{suffix}", "2025-04-01-preview")
+    api_key     = os.getenv(f"AZURE_OPENAI_KEY{suffix}", "").strip()
+
+    # -----------------------------------------------------------------------
+    # Enhanced validation & feedback
+    incomplete = {"https://", "http://", "https:/", "http:/", "https:", "http:"}
+    if raw_ep in incomplete:
+        st.error(
+            f"{ep_var} looks incomplete (**{raw_ep}**). "
+            "Paste the full resource URL, e.g. "
+            "`https://myresource.openai.azure.com`"
+        )
         return None
+    if not raw_ep:
+        st.error(f"{ep_var} is empty.  Please set it in .env or the sidebar.")
+        return None
+    if not raw_ep.startswith("https://"):
+        st.error(f"{ep_var} must start with https://  (got: {raw_ep})")
+        return None
+    if not deployment:
+        st.error(f"AZURE_OPENAI_DEPLOYMENT{suffix} is empty.")
+        return None
+    # -----------------------------------------------------------------------
 
-    base_ep = raw_ep.split("/openai")[0]
-    host    = urlparse(base_ep).hostname or base_ep.replace("https://", "")
+    # Extract the base endpoint without accidentally truncating the domain
+    parsed = urlparse(raw_ep)
+    if parsed.path.lower().startswith("/openai"):
+        # Endpoint was provided with the "/openai" suffix – strip it safely
+        base_ep = f"{parsed.scheme}://{parsed.netloc}"
+    else:
+        # Endpoint came without the suffix; just make sure there is no trailing slash
+        base_ep = raw_ep.rstrip("/")
+
+    host = urlparse(base_ep).hostname or ""
+    if host in {"https:", "http:"} or not host:
+        st.error(
+            f"{ep_var} host part looks invalid (**{raw_ep}**). "
+            "Expected format: https://<resource>.openai.azure.com"
+        )
+        return None
+    # -----------------------------------------------------
+
+    ok, err = _check_tls(host)
+    if not ok:
+        st.error(f"❌ Cannot reach {host}: {err}")
+        return None
 
     # best-effort TLS probe (fail-soft)
     try:
@@ -294,27 +353,39 @@ def search_documents(search_client, query: str, top: int = 25) -> List[Dict]:
         return []
 
 def generate_answer(openai_client, query: str, context: str) -> str:
-    """Generate answer and expose the exact REST URL used by the SDK."""
+    """Generate answer with model-specific parameters."""
     if not openai_client:
         return "OpenAI client not initialized"
 
-    endpoint   = os.getenv("AZURE_OPENAI_ENDPOINT", "N/A").rstrip("/")
-    deployment = os.getenv("AZURE_OPENAI_DEPLOYMENT", "N/A")
-    api_ver    = os.getenv("AZURE_OPENAI_API_VERSION", "N/A")
+    model_type = st.session_state.selected_model
+    suffix = "_4o" if model_type == "4o" else ("_41" if model_type == "41" else "")
+    
+    endpoint   = os.getenv(f"AZURE_OPENAI_ENDPOINT{suffix}", "N/A").rstrip("/")
+    deployment = os.getenv(f"AZURE_OPENAI_DEPLOYMENT{suffix}", "N/A")
+    api_ver    = os.getenv(f"AZURE_OPENAI_API_VERSION{suffix}", "N/A")
 
     # derive the exact URL the SDK will hit
     base = endpoint if endpoint.endswith("/openai") else f"{endpoint}/openai"
     api_url = f"{base}/deployments/{deployment}/chat/completions?api-version={api_ver}"
 
     try:
-        response = openai_client.chat.completions.create(
-            model=deployment,
-            messages=[
+        # Base parameters
+        params = {
+            "model": deployment,
+            "messages": [
                 {"role": "system", "content": "אתה עוזר AI שעונה על שאלות בעברית בהתבסס על המסמכים שניתנו לך.\nענה רק על סמך המידע שבמסמכים. אם אין מספיק מידע לענות על השאלה, אמור זאת בבירור.\nענה בעברית תמיד."},
-                {"role": "user",   "content": f"בהתבסס על המסמכים הבאים:\n\n{context}\n\nענה על השאלה הבאה: {query}"}
-            ],
-            max_completion_tokens=20000
-        )
+                {"role": "user", "content": f"בהתבסס על המסמכים הבאים:\n\n{context}\n\nענה על השאלה הבאה: {query}"}
+            ]
+        }
+        
+        # Model-specific parameters
+        if model_type == "o3":
+            params["max_completion_tokens"] = 20000
+        else:  # 4o
+            params["temperature"] = 0.7
+            params["max_tokens"] = 4000
+        
+        response = openai_client.chat.completions.create(**params)
         return response.choices[0].message.content
 
     except APIConnectionError as ce:
@@ -345,9 +416,10 @@ def generate_answer(openai_client, query: str, context: str) -> str:
         return f"שגיאה ביצירת תשובה: {e}"
 
 # ---------- helper to rebuild the cached OpenAI client ----------
-def refresh_openai_client():
+def refresh_openai_client(model_type="o3"):
+    # Clear all cached versions
     init_openai_client.clear()
-    return init_openai_client()
+    return init_openai_client(model_type)
 # ----------------------------------------------------------------
 
 
@@ -360,6 +432,67 @@ def refresh_search_client():
 
 # Sidebar for configuration, index selection and file-upload
 with st.sidebar:
+    # Model selector - place at the top
+    st.header("🤖 Model Selection")
+    # Allow picking o3, 4o or the new 41 deployment
+    MODEL_CHOICES = ["o3", "4o", "41"]
+    selected_model = st.selectbox(
+        "Choose AI Model:",
+        options=MODEL_CHOICES,
+        index=MODEL_CHOICES.index(st.session_state.selected_model)
+               if st.session_state.selected_model in MODEL_CHOICES else 0,
+        help="o3 – reasoning model | 4o – GPT‑4o | 41 – GPT‑4.1 preview"
+    )
+    
+    if selected_model != st.session_state.selected_model:
+        st.session_state.selected_model = selected_model
+        # Refresh client when model changes
+        refresh_openai_client(selected_model)
+        st.success(f"Switched to {selected_model} model")
+    
+    # Show current OpenAI configuration
+    suffix = "_4o" if selected_model == "4o" else ("_41" if selected_model == "41" else "")
+    with st.expander(f"🔧 {selected_model} OpenAI Settings", expanded=False):
+        st.text_input(
+            "Endpoint",
+            value=os.getenv(f"AZURE_OPENAI_ENDPOINT{suffix}", ""),
+            key=f"openai_endpoint_{selected_model}",
+            help="e.g. https://myresource.openai.azure.com"
+        )
+        st.text_input(
+            "Deployment",
+            value=os.getenv(f"AZURE_OPENAI_DEPLOYMENT{suffix}", ""),
+            key=f"openai_deployment_{selected_model}"
+        )
+        st.text_input(
+            "API Key",
+            value=os.getenv(f"AZURE_OPENAI_KEY{suffix}", ""),
+            key=f"openai_key_{selected_model}",
+            type="password"
+        )
+        st.text_input(
+            "API Version",
+            value=os.getenv(f"AZURE_OPENAI_API_VERSION{suffix}", ""),
+            key=f"openai_version_{selected_model}",
+            help="e.g. 2025-01-01-preview"
+        )
+        
+        if st.button(f"Update {selected_model} Settings"):
+            # Update environment variables
+            os.environ[f"AZURE_OPENAI_ENDPOINT{suffix}"] = st.session_state[f"openai_endpoint_{selected_model}"]
+            os.environ[f"AZURE_OPENAI_DEPLOYMENT{suffix}"] = st.session_state[f"openai_deployment_{selected_model}"]
+            os.environ[f"AZURE_OPENAI_KEY{suffix}"] = st.session_state[f"openai_key_{selected_model}"]
+            os.environ[f"AZURE_OPENAI_API_VERSION{suffix}"] = st.session_state[f"openai_version_{selected_model}"]
+            
+            # Refresh the client
+            openai_client = refresh_openai_client(selected_model)
+            if openai_client:
+                st.success(f"Updated {selected_model} settings successfully")
+            else:
+                st.error(f"Failed to create {selected_model} client with new settings")
+    
+    st.divider()
+    
     st.header("⚙️  Azure Search Settings")
 
     # --- NEW: editable endpoint & key ---
@@ -408,148 +541,124 @@ with st.sidebar:
         if selected_index:
             st.session_state.selected_index = selected_index
             st.success(f"Using index: {selected_index}")
-            
-            # Show index info
+
+            # ------- FIXED: index-info block ----------
             if sidebar_index_client:
                 try:
                     index = sidebar_index_client.get_index(selected_index)
                     with st.expander("Index Information", expanded=False):
-                        st.write(f"Fields: {', '.join([field.name for field in index.fields])}")
+                        st.write(", ".join(f"{f.name} ({f.type})" for f in index.fields))
                 except Exception as e:
-                    st.error(f"Error getting index info: {str(e)}")
-    
+                    st.error(f"Error getting index info: {e}")
+            # ------------------------------------------
+
     st.divider()
-    
+
+    # ---------------- FIXED: upload-files block ----------------
     st.header("📁 Upload New Files")
-    st.info("You can also upload new PDF files to create a new index or add to existing one")
-    
+    st.info("Upload one or more PDF files to add pages to the current index "
+            "or create a new one.")
     uploaded_files = st.file_uploader(
-        "בחר קבצי PDF",
-        type=['pdf'],
-        accept_multiple_files=True,
-        help="ניתן להעלות מספר קבצי PDF בו זמנית"
+        "Choose PDF files", type=["pdf"], accept_multiple_files=True,
+        help="You can upload multiple PDF files at once"
     )
-    
+
     if uploaded_files:
-        openai_client = init_openai_client()
-        
-        # Option to create new index or use selected one
-        if st.session_state.selected_index:
-            use_existing = st.checkbox(f"Add to existing index: {st.session_state.selected_index}", value=True)
-            if not use_existing:
-                new_index_name = st.text_input("New index name:", value="rag-demo-index-new")
-                st.session_state.selected_index = new_index_name
+        # target index
+        if not st.session_state.selected_index:
+            st.error("Choose or create an index first (see dropdown above).")
         else:
-            new_index_name = st.text_input("New index name:", value=AZURE_SEARCH_INDEX)
-            st.session_state.selected_index = new_index_name
-        
-        search_client, index_client = init_search_client(st.session_state.selected_index)
-        
-        if st.button("🔄 עבד וצור אינדקס", type="primary"):
-            with st.spinner("מעבד קבצים..."):
-                all_documents = []
+            search_client, index_client = init_search_client(
+                st.session_state.selected_index
+            )
+            if st.button("🔄 Process & Index", type="primary"):
+                with st.spinner("Extracting text and uploading…"):
+                    new_docs = []
+                    idx = st.session_state.selected_index
+                    st.session_state.indexed_documents.setdefault(idx, set())
 
-                # Ensure we have a bucket for the current index
-                idx = st.session_state.selected_index
-                if idx not in st.session_state.indexed_documents:
-                    st.session_state.indexed_documents[idx] = set()
+                    for f in uploaded_files:
+                        if f.name in st.session_state.indexed_documents[idx]:
+                            continue
+                        new_docs.extend(extract_text_from_pdf(f))
+                        st.session_state.indexed_documents[idx].add(f.name)
 
-                for uploaded_file in uploaded_files:
-                    # Re‑process the PDF if it has **not** yet been sent to *this* index
-                    if uploaded_file.name not in st.session_state.indexed_documents[idx]:
-                        documents = extract_text_from_pdf(uploaded_file)
-                        all_documents.extend(documents)
-                        st.session_state.indexed_documents[idx].add(uploaded_file.name)
+                    if new_docs:
+                        if idx not in st.session_state.available_indexes:
+                            create_search_index(index_client)
+                        index_documents(search_client, new_docs)
+                        st.session_state.uploaded_files = sorted(
+                            {fn for s in st.session_state.indexed_documents.values()
+                                   for fn in s}
+                        )
+    # -----------------------------------------------------------
 
-                if all_documents and search_client:
-                    # Create index if needed
-                    if st.session_state.selected_index not in st.session_state.available_indexes:
-                        create_search_index(index_client)
-                    index_documents(search_client, all_documents)
-                    # Flatten all filenames from every index for display purposes
-                    flat_files = {f for files in st.session_state.indexed_documents.values() for f in files}
-                    st.session_state.uploaded_files = sorted(flat_files)
-    
-    # Display indexed files
-    if st.session_state.uploaded_files:
-        st.divider()
-        st.subheader("📚 Recently Uploaded Files")
-        for file in st.session_state.uploaded_files:
-            st.text(f"• {file}")
+# ----------------------- Main chat interface -----------------------
+st.header("💬 Ask a Question")
 
-# Main chat interface
-st.header("💬 שאל שאלה")
+# Show current model in use
+st.info(f"🤖 Using model: **{st.session_state.selected_model}**")
 
-# Initialize clients
-openai_client = init_openai_client()
+# Initialize (or refresh) clients
+openai_client = init_openai_client(st.session_state.selected_model)
 search_client, index_client = init_search_client(st.session_state.selected_index)
 
-# Show current index status
+# Index status message
 if st.session_state.selected_index:
     st.info(f"🔍 Searching in index: **{st.session_state.selected_index}**")
 else:
     st.warning("⚠️ Please select an index from the sidebar to search")
 
-# Chat input
+# User query
 user_question = st.text_input(
-    "הקלד את שאלתך כאן:",
-    placeholder="למשל: מה אומר המסמך על...",
+    "Type your question here:",
+    placeholder="e.g.: What does the document say about…",
     key="user_input"
 )
 
-if user_question and st.button("🔍 חפש תשובה", type="primary"):
+if user_question and st.button("🔍 Search Answer", type="primary"):
     if not st.session_state.selected_index:
         st.error("Please select an index first")
     elif not search_client:
-        st.error("Azure Search לא מוגדר כראוי")
+        st.error("Azure Search is not properly configured")
     else:
         with st.spinner("מחפש במסמכים..."):
-            # Search for relevant documents
             search_results = search_documents(search_client, user_question, top=25)
 
-            
-            if search_results:
-                # Prepare context from search results
-                context = "\n\n".join([
-                    f"מקור: {doc['source']} "
-                    f"{'(עמוד ' + str(doc['page']) + ')' if doc['page'] else ''}\n"
-                    f"{doc['content'][:2000]}..."
-                    for doc in search_results
-                ])
+        if search_results:
+            # ---------- fixed block ----------
+            def _fmt(doc):
+                page = f"(page {doc['page']})" if doc.get("page") else ""
+                return (f"Source: {doc['source']} {page}\n"
+                        f"{doc['content'][:2000]}...")
+            context = "\n\n".join(_fmt(d) for d in search_results)
+            # ----------------------------------
 
-                # 🔎 Optional debug panels to inspect what the RAG pipeline is sending
-                with st.expander("🔎 Debug: RAG context sent to the LLM", expanded=False):
-                    st.code(context, language="markdown")
+            with st.expander("🔎 Debug: RAG context sent to the LLM", expanded=False):
+                st.code(context, language="markdown")
+            with st.expander("🔎 Debug: raw search hits", expanded=False):
+                st.json(search_results)
 
-                with st.expander("🔎 Debug: raw search hits", expanded=False):
-                    st.json(search_results)
-                
-                # Generate answer
-                with st.spinner("מייצר תשובה..."):
-                    answer = generate_answer(openai_client, user_question, context)
-                
-                # Display results
-                st.divider()
-                
-                # Answer section
-                st.subheader("📝 תשובה")
-                if answer and str(answer).strip():
-                    # show as rich markdown
-                    st.markdown(str(answer))
-                else:
-                    st.warning("⚠️ המודל החזיר תשובה ריקה או שלא חזרה תשובה.")
-                    with st.expander("Debug: raw answer", expanded=False):
-                        st.text(repr(answer))
-                
-                # Sources section
-                with st.expander("📚 מקורות רלוונטיים", expanded=False):
-                    for i, doc in enumerate(search_results):
-                        st.markdown(f"**{i+1}. {doc['source']} - עמוד {doc['page']}**")
-                        st.text(doc['content'][:300] + "...")
-                        st.divider()
+            with st.spinner("מייצר תשובה..."):
+                answer = generate_answer(openai_client, user_question, context)
+
+            st.divider()
+            st.subheader("📝 Answer")
+            if answer and answer.strip():
+                st.markdown(answer)
             else:
-                st.info("לא נמצאו מסמכים רלוונטיים לשאלתך")
+                st.warning("⚠️ המודל החזיר תשובה ריקה או שלא חזרה תשובה.")
+                with st.expander("Debug: raw answer", expanded=False):
+                    st.text(repr(answer))
 
-# Footer
+            with st.expander("📚 Relevant Sources", expanded=False):
+                for i, d in enumerate(search_results, 1):
+                    st.markdown(f"**{i}. {d['source']} - page {d['page']}**")
+                    st.text(d['content'][:300] + "…")
+                    st.divider()
+        else:
+            st.info("No relevant documents were found for your question")
+
+# ----------------------------- Footer ------------------------------
 st.divider()
 st.caption("RAG Demo with Azure o3 - Built with Streamlit")
